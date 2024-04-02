@@ -1,4 +1,3 @@
-use std::pin::Pin;
 use std::sync::atomic::Ordering::SeqCst;
 use std::sync::atomic::{AtomicBool, AtomicUsize};
 use std::sync::{Arc, Mutex};

@@ -1,17 +1,17 @@
 use core::pin::Pin;
 use std::boxed::Box;
-use std::cell::{Cell, UnsafeCell};
-use std::{cmp, dbg};
+use std::cell::Cell;
+use std::cmp;
 use std::fmt;
 use std::marker::PhantomData;
 use std::mem::{self, MaybeUninit};
 use std::ptr;
 use std::slice;
-use std::sync::atomic::{self, AtomicIsize, AtomicPtr, AtomicUsize, Ordering};
+use std::sync::atomic::{self, AtomicIsize, Ordering};
 use std::sync::{Arc, Mutex, TryLockError};
 
 use crossbeam_epoch::{self as epoch, Atomic, Owned};
-use crossbeam_utils::{Backoff, CachePadded};
+use crossbeam_utils::CachePadded;
 use pin_queue::{GetIntrusive, SharedPointer};
 
 // Minimum buffer capacity.
@@ -1181,109 +1181,6 @@ impl<T> fmt::Debug for Stealer<T> {
     }
 }
 
-// Bits indicating the state of a slot:
-// * If a task has been written into the slot, `WRITE` is set.
-// * If a task has been read from the slot, `READ` is set.
-// * If the block is being destroyed, `DESTROY` is set.
-const WRITE: usize = 1;
-const READ: usize = 2;
-const DESTROY: usize = 4;
-
-// Each block covers one "lap" of indices.
-const LAP: usize = 64;
-// The maximum number of values a block can hold.
-const BLOCK_CAP: usize = LAP - 1;
-// How many lower bits are reserved for metadata.
-const SHIFT: usize = 1;
-// Indicates that the block is not the last one.
-const HAS_NEXT: usize = 1;
-
-/// A slot in a block.
-struct Slot<T> {
-    /// The task.
-    task: UnsafeCell<MaybeUninit<T>>,
-
-    /// The state of the slot.
-    state: AtomicUsize,
-}
-
-impl<T> Slot<T> {
-    const UNINIT: Self = Self {
-        task: UnsafeCell::new(MaybeUninit::uninit()),
-        state: AtomicUsize::new(0),
-    };
-
-    /// Waits until a task is written into the slot.
-    fn wait_write(&self) {
-        let backoff = Backoff::new();
-        while self.state.load(Ordering::Acquire) & WRITE == 0 {
-            backoff.snooze();
-        }
-    }
-}
-
-/// A block in a linked list.
-///
-/// Each block in the list can hold up to `BLOCK_CAP` values.
-struct Block<T> {
-    /// The next block in the linked list.
-    next: AtomicPtr<Block<T>>,
-
-    /// Slots for values.
-    slots: [Slot<T>; BLOCK_CAP],
-}
-
-impl<T> Block<T> {
-    /// Creates an empty block that starts at `start_index`.
-    fn new() -> Self {
-        Self {
-            next: AtomicPtr::new(ptr::null_mut()),
-            slots: [Slot::UNINIT; BLOCK_CAP],
-        }
-    }
-
-    /// Waits until the next pointer is set.
-    fn wait_next(&self) -> *mut Self {
-        let backoff = Backoff::new();
-        loop {
-            let next = self.next.load(Ordering::Acquire);
-            if !next.is_null() {
-                return next;
-            }
-            backoff.snooze();
-        }
-    }
-
-    /// Sets the `DESTROY` bit in slots starting from `start` and destroys the block.
-    unsafe fn destroy(this: *mut Self, count: usize) {
-        // It is not necessary to set the `DESTROY` bit in the last slot because that slot has
-        // begun destruction of the block.
-        for i in (0..count).rev() {
-            let slot = unsafe { (*this).slots.get_unchecked(i) };
-
-            // Mark the `DESTROY` bit if a thread is still using the slot.
-            if slot.state.load(Ordering::Acquire) & READ == 0
-                && slot.state.fetch_or(DESTROY, Ordering::AcqRel) & READ == 0
-            {
-                // If a thread is still using the slot, it will continue destruction of the block.
-                return;
-            }
-        }
-
-        // No thread is using the block, now it is safe to destroy it.
-        drop(unsafe { Box::from_raw(this) });
-    }
-}
-
-/// A position in a queue.
-struct Position<T> {
-    /// The index in the queue.
-    index: AtomicUsize,
-
-    /// The block in the linked list.
-    block: AtomicPtr<Block<T>>,
-}
-
 /// An injector queue.
 ///
 /// This is a FIFO queue that can be shared among multiple threads. Task schedulers typically have
@@ -1311,11 +1208,9 @@ struct InjectorInner<Key: GetIntrusive<QueueTypes<Key, Task>> + 'static, Task: S
     length: usize,
 }
 
+/// Type exposed from pin-queue
 pub type QueueTypes<Key, Task> =
     dyn pin_queue::Types<Id = pin_queue::id::Checked, Key = Key, Pointer = Task>;
-
-// unsafe impl<T: Send> Send for Injector<T> {}
-// unsafe impl<T: Send> Sync for Injector<T> {}
 
 impl<K: GetIntrusive<QueueTypes<K, T>> + 'static, T: SharedPointer> Default for Injector<K, T> {
     fn default() -> Self {

@@ -3,7 +3,7 @@ use std::sync::atomic::Ordering::SeqCst;
 use std::sync::atomic::{AtomicBool, AtomicUsize};
 use std::sync::{Arc, Mutex};
 
-use crossbeam_intrusion::Steal::{Empty, Success};
+use crossbeam_intrusion::Steal::Success;
 use crossbeam_intrusion::{Injector, Worker};
 use crossbeam_utils::thread::scope;
 use rand::Rng;
