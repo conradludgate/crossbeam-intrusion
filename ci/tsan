@@ -1,0 +1,7 @@
+# TSAN suppressions file for crossbeam
+
+# Push and steal operations in crossbeam-deque may cause data races, but such
+# data races are safe. If a data race happens, the value read by `steal` is
+# forgotten and the steal operation is then retried.
+race:crossbeam_intrusion*push
+race:crossbeam_intrusion*steal

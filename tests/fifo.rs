@@ -1,3 +1,4 @@
+use std::pin::Pin;
 use std::sync::atomic::Ordering::SeqCst;
 use std::sync::atomic::{AtomicBool, AtomicUsize};
 use std::sync::{Arc, Mutex};
@@ -11,36 +12,36 @@ use rand::Rng;
 fn smoke() {
     let w = Worker::new_fifo();
     let s = w.stealer();
-    assert_eq!(w.pop(), None);
+    assert_eq!(w.pop().as_deref(), None);
     assert_eq!(s.steal(), Empty);
 
-    w.push(1);
-    assert_eq!(w.pop(), Some(1));
-    assert_eq!(w.pop(), None);
+    w.push(Arc::pin(1));
+    assert_eq!(w.pop().as_deref(), Some(&1));
+    assert_eq!(w.pop().as_deref(), None);
     assert_eq!(s.steal(), Empty);
 
-    w.push(2);
-    assert_eq!(s.steal(), Success(2));
+    w.push(Arc::pin(2));
+    assert_eq!(s.steal(), Success(Arc::pin(2)));
     assert_eq!(s.steal(), Empty);
-    assert_eq!(w.pop(), None);
+    assert_eq!(w.pop().as_deref(), None);
 
-    w.push(3);
-    w.push(4);
-    w.push(5);
-    assert_eq!(s.steal(), Success(3));
-    assert_eq!(s.steal(), Success(4));
-    assert_eq!(s.steal(), Success(5));
+    w.push(Arc::pin(3));
+    w.push(Arc::pin(4));
+    w.push(Arc::pin(5));
+    assert_eq!(s.steal(), Success(Arc::pin(3)));
+    assert_eq!(s.steal(), Success(Arc::pin(4)));
+    assert_eq!(s.steal(), Success(Arc::pin(5)));
     assert_eq!(s.steal(), Empty);
 
-    w.push(6);
-    w.push(7);
-    w.push(8);
-    w.push(9);
-    assert_eq!(w.pop(), Some(6));
-    assert_eq!(s.steal(), Success(7));
-    assert_eq!(w.pop(), Some(8));
-    assert_eq!(w.pop(), Some(9));
-    assert_eq!(w.pop(), None);
+    w.push(Arc::pin(6));
+    w.push(Arc::pin(7));
+    w.push(Arc::pin(8));
+    w.push(Arc::pin(9));
+    assert_eq!(w.pop().as_deref(), Some(&6));
+    assert_eq!(s.steal(), Success(Arc::pin(7)));
+    assert_eq!(w.pop().as_deref(), Some(&8));
+    assert_eq!(w.pop().as_deref(), Some(&9));
+    assert_eq!(w.pop().as_deref(), None);
 }
 
 #[test]
@@ -49,9 +50,9 @@ fn is_empty() {
     let s = w.stealer();
 
     assert!(w.is_empty());
-    w.push(1);
+    w.push(Arc::pin(1));
     assert!(!w.is_empty());
-    w.push(2);
+    w.push(Arc::pin(2));
     assert!(!w.is_empty());
     let _ = w.pop();
     assert!(!w.is_empty());
@@ -59,9 +60,9 @@ fn is_empty() {
     assert!(w.is_empty());
 
     assert!(s.is_empty());
-    w.push(1);
+    w.push(Arc::pin(1));
     assert!(!s.is_empty());
-    w.push(2);
+    w.push(Arc::pin(2));
     assert!(!s.is_empty());
     let _ = s.steal();
     assert!(!s.is_empty());
@@ -84,7 +85,7 @@ fn spsc() {
             for i in 0..STEPS {
                 loop {
                     if let Success(v) = s.steal() {
-                        assert_eq!(i, v);
+                        assert_eq!(i, *v);
                         break;
                     }
                 }
@@ -94,7 +95,7 @@ fn spsc() {
         });
 
         for i in 0..STEPS {
-            w.push(i);
+            w.push(Arc::pin(i));
         }
     })
     .unwrap();
@@ -111,7 +112,7 @@ fn stampede() {
     let w = Worker::new_fifo();
 
     for i in 0..COUNT {
-        w.push(Box::new(i + 1));
+        w.push(Arc::pin(i + 1));
     }
     let remaining = Arc::new(AtomicUsize::new(COUNT));
 
@@ -191,7 +192,7 @@ fn stress() {
                     hits.fetch_add(1, SeqCst);
                 }
             } else {
-                w.push(expected);
+                w.push(Arc::pin(expected));
                 expected += 1;
             }
         }
@@ -253,7 +254,7 @@ fn no_starvation() {
                         my_hits += 1;
                     }
                 } else {
-                    w.push(i);
+                    w.push(Arc::pin(i));
                 }
             }
 
@@ -294,7 +295,7 @@ fn destructors() {
     let remaining = Arc::new(AtomicUsize::new(COUNT));
 
     for i in 0..COUNT {
-        w.push(Elem(i, dropped.clone()));
+        w.push(Arc::pin(Elem(i, dropped.clone())));
     }
 
     scope(|scope| {

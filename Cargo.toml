@@ -25,8 +25,9 @@ std = ["crossbeam-epoch/std", "crossbeam-utils/std"]
 
 [dependencies]
 pin-queue = { git = "https://github.com/conradludgate/pin-queue" }
-crossbeam-epoch = { version = "0.9.17", default-features = false }
-crossbeam-utils = { version = "0.8.18", default-features = false }
+crossbeam-epoch = { version = "0.9.18", default-features = false }
+crossbeam-utils = { version = "0.8.19", default-features = false }
 
 [dev-dependencies]
 rand = "0.8"
+pin-project-lite = "0.2"

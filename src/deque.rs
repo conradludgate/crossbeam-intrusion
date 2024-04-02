@@ -1,16 +1,18 @@
+use core::pin::Pin;
 use std::boxed::Box;
 use std::cell::{Cell, UnsafeCell};
-use std::cmp;
+use std::{cmp, dbg};
 use std::fmt;
 use std::marker::PhantomData;
 use std::mem::{self, MaybeUninit};
 use std::ptr;
 use std::slice;
 use std::sync::atomic::{self, AtomicIsize, AtomicPtr, AtomicUsize, Ordering};
-use std::sync::Arc;
+use std::sync::{Arc, Mutex, TryLockError};
 
 use crossbeam_epoch::{self as epoch, Atomic, Owned};
 use crossbeam_utils::{Backoff, CachePadded};
+use pin_queue::{GetIntrusive, SharedPointer};
 
 // Minimum buffer capacity.
 const MIN_CAP: usize = 64;
@@ -117,7 +119,7 @@ struct Inner<T> {
     back: AtomicIsize,
 
     /// The underlying buffer.
-    buffer: CachePadded<Atomic<Buffer<T>>>,
+    buffer: CachePadded<Atomic<Buffer<Pin<T>>>>,
 }
 
 impl<T> Drop for Inner<T> {
@@ -197,7 +199,7 @@ pub struct Worker<T> {
     inner: Arc<CachePadded<Inner<T>>>,
 
     /// A copy of `inner.buffer` for quick access.
-    buffer: Cell<Buffer<T>>,
+    buffer: Cell<Buffer<Pin<T>>>,
 
     /// The flavor of the queue.
     flavor: Flavor,
@@ -394,7 +396,7 @@ impl<T> Worker<T> {
     /// w.push(1);
     /// w.push(2);
     /// ```
-    pub fn push(&self, task: T) {
+    pub fn push(&self, task: Pin<T>) {
         // Load the back index, front index, and buffer.
         let b = self.inner.back.load(Ordering::Relaxed);
         let f = self.inner.front.load(Ordering::Acquire);
@@ -441,7 +443,7 @@ impl<T> Worker<T> {
     /// assert_eq!(w.pop(), Some(2));
     /// assert_eq!(w.pop(), None);
     /// ```
-    pub fn pop(&self) -> Option<T> {
+    pub fn pop(&self) -> Option<Pin<T>> {
         // Load the back and front index.
         let b = self.inner.back.load(Ordering::Relaxed);
         let f = self.inner.front.load(Ordering::Relaxed);
@@ -632,7 +634,7 @@ impl<T> Stealer<T> {
     /// assert_eq!(s.steal(), Steal::Success(1));
     /// assert_eq!(s.steal(), Steal::Success(2));
     /// ```
-    pub fn steal(&self) -> Steal<T> {
+    pub fn steal(&self) -> Steal<Pin<T>> {
         // Load the front index.
         let f = self.inner.front.load(Ordering::Acquire);
 
@@ -936,7 +938,7 @@ impl<T> Stealer<T> {
     /// assert_eq!(s.steal_batch_and_pop(&w2), Steal::Success(1));
     /// assert_eq!(w2.pop(), Some(2));
     /// ```
-    pub fn steal_batch_and_pop(&self, dest: &Worker<T>) -> Steal<T> {
+    pub fn steal_batch_and_pop(&self, dest: &Worker<T>) -> Steal<Pin<T>> {
         self.steal_batch_with_limit_and_pop(dest, MAX_BATCH)
     }
 
@@ -976,7 +978,7 @@ impl<T> Stealer<T> {
     /// assert_eq!(w2.pop(), Some(5));
     /// assert_eq!(w2.pop(), None);
     /// ```
-    pub fn steal_batch_with_limit_and_pop(&self, dest: &Worker<T>, limit: usize) -> Steal<T> {
+    pub fn steal_batch_with_limit_and_pop(&self, dest: &Worker<T>, limit: usize) -> Steal<Pin<T>> {
         assert!(limit > 0);
         if Arc::ptr_eq(&self.inner, &dest.inner) {
             match dest.pop() {
@@ -1300,38 +1302,34 @@ struct Position<T> {
 /// assert_eq!(q.steal(), Steal::Success(2));
 /// assert_eq!(q.steal(), Steal::Empty);
 /// ```
-pub struct Injector<T> {
-    /// The head of the queue.
-    head: CachePadded<Position<T>>,
-
-    /// The tail of the queue.
-    tail: CachePadded<Position<T>>,
-
-    /// Indicates that dropping a `Injector<T>` may drop values of type `T`.
-    _marker: PhantomData<T>,
+pub struct Injector<Key: GetIntrusive<QueueTypes<Key, Task>> + 'static, Task: SharedPointer> {
+    inner: Mutex<InjectorInner<Key, Task>>,
 }
 
-unsafe impl<T: Send> Send for Injector<T> {}
-unsafe impl<T: Send> Sync for Injector<T> {}
+struct InjectorInner<Key: GetIntrusive<QueueTypes<Key, Task>> + 'static, Task: SharedPointer> {
+    queue: pin_queue::PinQueue<QueueTypes<Key, Task>>,
+    length: usize,
+}
 
-impl<T> Default for Injector<T> {
+pub type QueueTypes<Key, Task> =
+    dyn pin_queue::Types<Id = pin_queue::id::Checked, Key = Key, Pointer = Task>;
+
+// unsafe impl<T: Send> Send for Injector<T> {}
+// unsafe impl<T: Send> Sync for Injector<T> {}
+
+impl<K: GetIntrusive<QueueTypes<K, T>> + 'static, T: SharedPointer> Default for Injector<K, T> {
     fn default() -> Self {
-        let block = Box::into_raw(Box::new(Block::<T>::new()));
+        // let block = Box::into_raw(Box::new(Block::<T>::new()));
         Self {
-            head: CachePadded::new(Position {
-                block: AtomicPtr::new(block),
-                index: AtomicUsize::new(0),
+            inner: Mutex::new(InjectorInner {
+                queue: pin_queue::PinQueue::new(pin_queue::id::Checked::new()),
+                length: 0,
             }),
-            tail: CachePadded::new(Position {
-                block: AtomicPtr::new(block),
-                index: AtomicUsize::new(0),
-            }),
-            _marker: PhantomData,
         }
     }
 }
 
-impl<T> Injector<T> {
+impl<K: GetIntrusive<QueueTypes<K, T>> + 'static, T: SharedPointer> Injector<K, T> {
     /// Creates a new injector queue.
     ///
     /// # Examples
@@ -1356,64 +1354,68 @@ impl<T> Injector<T> {
     /// w.push(1);
     /// w.push(2);
     /// ```
-    pub fn push(&self, task: T) {
-        let backoff = Backoff::new();
-        let mut tail = self.tail.index.load(Ordering::Acquire);
-        let mut block = self.tail.block.load(Ordering::Acquire);
-        let mut next_block = None;
+    pub fn push(&self, task: Pin<T>) {
+        let mut inner = self.inner.lock().unwrap();
+        inner.queue.push_back(task).unwrap();
+        inner.length += 1;
 
-        loop {
-            // Calculate the offset of the index into the block.
-            let offset = (tail >> SHIFT) % LAP;
+        // let backoff = Backoff::new();
+        // let mut tail = self.tail.index.load(Ordering::Acquire);
+        // let mut block = self.tail.block.load(Ordering::Acquire);
+        // let mut next_block = None;
 
-            // If we reached the end of the block, wait until the next one is installed.
-            if offset == BLOCK_CAP {
-                backoff.snooze();
-                tail = self.tail.index.load(Ordering::Acquire);
-                block = self.tail.block.load(Ordering::Acquire);
-                continue;
-            }
+        // loop {
+        //     // Calculate the offset of the index into the block.
+        //     let offset = (tail >> SHIFT) % LAP;
 
-            // If we're going to have to install the next block, allocate it in advance in order to
-            // make the wait for other threads as short as possible.
-            if offset + 1 == BLOCK_CAP && next_block.is_none() {
-                next_block = Some(Box::new(Block::<T>::new()));
-            }
+        //     // If we reached the end of the block, wait until the next one is installed.
+        //     if offset == BLOCK_CAP {
+        //         backoff.snooze();
+        //         tail = self.tail.index.load(Ordering::Acquire);
+        //         block = self.tail.block.load(Ordering::Acquire);
+        //         continue;
+        //     }
 
-            let new_tail = tail + (1 << SHIFT);
+        //     // If we're going to have to install the next block, allocate it in advance in order to
+        //     // make the wait for other threads as short as possible.
+        //     if offset + 1 == BLOCK_CAP && next_block.is_none() {
+        //         next_block = Some(Box::new(Block::<T>::new()));
+        //     }
 
-            // Try advancing the tail forward.
-            match self.tail.index.compare_exchange_weak(
-                tail,
-                new_tail,
-                Ordering::SeqCst,
-                Ordering::Acquire,
-            ) {
-                Ok(_) => unsafe {
-                    // If we've reached the end of the block, install the next one.
-                    if offset + 1 == BLOCK_CAP {
-                        let next_block = Box::into_raw(next_block.unwrap());
-                        let next_index = new_tail.wrapping_add(1 << SHIFT);
+        //     let new_tail = tail + (1 << SHIFT);
 
-                        self.tail.block.store(next_block, Ordering::Release);
-                        self.tail.index.store(next_index, Ordering::Release);
-                        (*block).next.store(next_block, Ordering::Release);
-                    }
+        //     // Try advancing the tail forward.
+        //     match self.tail.index.compare_exchange_weak(
+        //         tail,
+        //         new_tail,
+        //         Ordering::SeqCst,
+        //         Ordering::Acquire,
+        //     ) {
+        //         Ok(_) => unsafe {
+        //             // If we've reached the end of the block, install the next one.
+        //             if offset + 1 == BLOCK_CAP {
+        //                 let next_block = Box::into_raw(next_block.unwrap());
+        //                 let next_index = new_tail.wrapping_add(1 << SHIFT);
 
-                    // Write the task into the slot.
-                    let slot = (*block).slots.get_unchecked(offset);
-                    slot.task.get().write(MaybeUninit::new(task));
-                    slot.state.fetch_or(WRITE, Ordering::Release);
+        //                 self.tail.block.store(next_block, Ordering::Release);
+        //                 self.tail.index.store(next_index, Ordering::Release);
+        //                 (*block).next.store(next_block, Ordering::Release);
+        //             }
 
-                    return;
-                },
-                Err(t) => {
-                    tail = t;
-                    block = self.tail.block.load(Ordering::Acquire);
-                    backoff.spin();
-                }
-            }
-        }
+        //             // Write the task into the slot.
+        //             let slot = (*block).slots.get_unchecked(offset);
+        //             slot.task.get().write(MaybeUninit::new(task));
+        //             slot.state.fetch_or(WRITE, Ordering::Release);
+
+        //             return;
+        //         },
+        //         Err(t) => {
+        //             tail = t;
+        //             block = self.tail.block.load(Ordering::Acquire);
+        //             backoff.spin();
+        //         }
+        //     }
+        // }
     }
 
     /// Steals a task from the queue.
@@ -1431,82 +1433,90 @@ impl<T> Injector<T> {
     /// assert_eq!(q.steal(), Steal::Success(2));
     /// assert_eq!(q.steal(), Steal::Empty);
     /// ```
-    pub fn steal(&self) -> Steal<T> {
-        let mut head;
-        let mut block;
-        let mut offset;
+    pub fn steal(&self) -> Steal<Pin<T>> {
+        let mut inner = match self.inner.try_lock() {
+            Ok(inner) => inner,
+            Err(TryLockError::Poisoned(e)) => panic!("{e}"),
+            Err(TryLockError::WouldBlock) => return Steal::Retry,
+        };
+        inner.length = inner.length.saturating_sub(1);
+        inner.queue.pop_front().map_or(Steal::Empty, Steal::Success)
 
-        let backoff = Backoff::new();
-        loop {
-            head = self.head.index.load(Ordering::Acquire);
-            block = self.head.block.load(Ordering::Acquire);
+        // let mut head;
+        // let mut block;
+        // let mut offset;
 
-            // Calculate the offset of the index into the block.
-            offset = (head >> SHIFT) % LAP;
+        // let backoff = Backoff::new();
+        // loop {
+        //     head = self.head.index.load(Ordering::Acquire);
+        //     block = self.head.block.load(Ordering::Acquire);
 
-            // If we reached the end of the block, wait until the next one is installed.
-            if offset == BLOCK_CAP {
-                backoff.snooze();
-            } else {
-                break;
-            }
-        }
+        //     // Calculate the offset of the index into the block.
+        //     offset = (head >> SHIFT) % LAP;
 
-        let mut new_head = head + (1 << SHIFT);
+        //     // If we reached the end of the block, wait until the next one is installed.
+        //     if offset == BLOCK_CAP {
+        //         backoff.snooze();
+        //     } else {
+        //         break;
+        //     }
+        // }
 
-        if new_head & HAS_NEXT == 0 {
-            atomic::fence(Ordering::SeqCst);
-            let tail = self.tail.index.load(Ordering::Relaxed);
+        // let mut new_head = head + (1 << SHIFT);
 
-            // If the tail equals the head, that means the queue is empty.
-            if head >> SHIFT == tail >> SHIFT {
-                return Steal::Empty;
-            }
+        // if new_head & HAS_NEXT == 0 {
+        //     atomic::fence(Ordering::SeqCst);
+        //     let tail = self.tail.index.load(Ordering::Relaxed);
 
-            // If head and tail are not in the same block, set `HAS_NEXT` in head.
-            if (head >> SHIFT) / LAP != (tail >> SHIFT) / LAP {
-                new_head |= HAS_NEXT;
-            }
-        }
+        //     // If the tail equals the head, that means the queue is empty.
+        //     if head >> SHIFT == tail >> SHIFT {
+        //         return Steal::Empty;
+        //     }
 
-        // Try moving the head index forward.
-        if self
-            .head
-            .index
-            .compare_exchange_weak(head, new_head, Ordering::SeqCst, Ordering::Acquire)
-            .is_err()
-        {
-            return Steal::Retry;
-        }
+        //     // If head and tail are not in the same block, set `HAS_NEXT` in head.
+        //     if (head >> SHIFT) / LAP != (tail >> SHIFT) / LAP {
+        //         new_head |= HAS_NEXT;
+        //     }
+        // }
 
-        unsafe {
-            // If we've reached the end of the block, move to the next one.
-            if offset + 1 == BLOCK_CAP {
-                let next = (*block).wait_next();
-                let mut next_index = (new_head & !HAS_NEXT).wrapping_add(1 << SHIFT);
-                if !(*next).next.load(Ordering::Relaxed).is_null() {
-                    next_index |= HAS_NEXT;
-                }
+        // // Try moving the head index forward.
+        // if self
+        //     .head
+        //     .index
+        //     .compare_exchange_weak(head, new_head, Ordering::SeqCst, Ordering::Acquire)
+        //     .is_err()
+        // {
+        //     return Steal::Retry;
+        // }
 
-                self.head.block.store(next, Ordering::Release);
-                self.head.index.store(next_index, Ordering::Release);
-            }
+        // unsafe {
+        //     // If we've reached the end of the block, move to the next one.
+        //     if offset + 1 == BLOCK_CAP {
+        //         let next = (*block).wait_next();
+        //         let mut next_index = (new_head & !HAS_NEXT).wrapping_add(1 << SHIFT);
+        //         if !(*next).next.load(Ordering::Relaxed).is_null() {
+        //             next_index |= HAS_NEXT;
+        //         }
 
-            // Read the task.
-            let slot = (*block).slots.get_unchecked(offset);
-            slot.wait_write();
-            let task = slot.task.get().read().assume_init();
+        //         self.head.block.store(next, Ordering::Release);
+        //         self.head.index.store(next_index, Ordering::Release);
+        //     }
 
-            // Destroy the block if we've reached the end, or if another thread wanted to destroy
-            // but couldn't because we were busy reading from the slot.
-            if (offset + 1 == BLOCK_CAP)
-                || (slot.state.fetch_or(READ, Ordering::AcqRel) & DESTROY != 0)
-            {
-                Block::destroy(block, offset);
-            }
+        //     // Read the task.
+        //     let slot = (*block).slots.get_unchecked(offset);
+        //     slot.wait_write();
+        //     let task = slot.task.get().read().assume_init();
 
-            Steal::Success(task)
-        }
+        //     // Destroy the block if we've reached the end, or if another thread wanted to destroy
+        //     // but couldn't because we were busy reading from the slot.
+        //     if (offset + 1 == BLOCK_CAP)
+        //         || (slot.state.fetch_or(READ, Ordering::AcqRel) & DESTROY != 0)
+        //     {
+        //         Block::destroy(block, offset);
+        //     }
+
+        //     Steal::Success(task)
+        // }
     }
 
     /// Steals a batch of tasks and pushes them into a worker.
@@ -1568,69 +1578,18 @@ impl<T> Injector<T> {
     /// ```
     pub fn steal_batch_with_limit(&self, dest: &Worker<T>, limit: usize) -> Steal<()> {
         assert!(limit > 0);
-        let mut head;
-        let mut block;
-        let mut offset;
 
-        let backoff = Backoff::new();
-        loop {
-            head = self.head.index.load(Ordering::Acquire);
-            block = self.head.block.load(Ordering::Acquire);
+        let mut inner = match self.inner.try_lock() {
+            Ok(inner) => inner,
+            Err(TryLockError::Poisoned(e)) => panic!("{e}"),
+            Err(TryLockError::WouldBlock) => return Steal::Retry,
+        };
 
-            // Calculate the offset of the index into the block.
-            offset = (head >> SHIFT) % LAP;
-
-            // If we reached the end of the block, wait until the next one is installed.
-            if offset == BLOCK_CAP {
-                backoff.snooze();
-            } else {
-                break;
-            }
+        if inner.length == 0 {
+            return Steal::Empty;
         }
 
-        let mut new_head = head;
-        let advance;
-
-        if new_head & HAS_NEXT == 0 {
-            atomic::fence(Ordering::SeqCst);
-            let tail = self.tail.index.load(Ordering::Relaxed);
-
-            // If the tail equals the head, that means the queue is empty.
-            if head >> SHIFT == tail >> SHIFT {
-                return Steal::Empty;
-            }
-
-            // If head and tail are not in the same block, set `HAS_NEXT` in head. Also, calculate
-            // the right batch size to steal.
-            if (head >> SHIFT) / LAP != (tail >> SHIFT) / LAP {
-                new_head |= HAS_NEXT;
-                // We can steal all tasks till the end of the block.
-                advance = (BLOCK_CAP - offset).min(limit);
-            } else {
-                let len = (tail - head) >> SHIFT;
-                // Steal half of the available tasks.
-                advance = ((len + 1) / 2).min(limit);
-            }
-        } else {
-            // We can steal all tasks till the end of the block.
-            advance = (BLOCK_CAP - offset).min(limit);
-        }
-
-        new_head += advance << SHIFT;
-        let new_offset = offset + advance;
-
-        // Try moving the head index forward.
-        if self
-            .head
-            .index
-            .compare_exchange_weak(head, new_head, Ordering::SeqCst, Ordering::Acquire)
-            .is_err()
-        {
-            return Steal::Retry;
-        }
-
-        // Reserve capacity for the stolen batch.
-        let batch_size = new_offset - offset;
+        let batch_size = usize::min((inner.length + 1) / 2, limit);
         dest.reserve(batch_size);
 
         // Get the destination buffer and back index.
@@ -1638,41 +1597,30 @@ impl<T> Injector<T> {
         let dest_b = dest.inner.back.load(Ordering::Relaxed);
 
         unsafe {
-            // If we've reached the end of the block, move to the next one.
-            if new_offset == BLOCK_CAP {
-                let next = (*block).wait_next();
-                let mut next_index = (new_head & !HAS_NEXT).wrapping_add(1 << SHIFT);
-                if !(*next).next.load(Ordering::Relaxed).is_null() {
-                    next_index |= HAS_NEXT;
-                }
-
-                self.head.block.store(next, Ordering::Release);
-                self.head.index.store(next_index, Ordering::Release);
-            }
-
             // Copy values from the injector into the destination queue.
             match dest.flavor {
                 Flavor::Fifo => {
                     for i in 0..batch_size {
-                        // Read the task.
-                        let slot = (*block).slots.get_unchecked(offset + i);
-                        slot.wait_write();
-                        let task = slot.task.get().read();
+                        // // Read the task.
+                        let task = inner.queue.pop_front().expect("task should be in queue");
+                        inner.length -= 1;
 
                         // Write it into the destination queue.
-                        dest_buffer.write(dest_b.wrapping_add(i as isize), task);
+                        dest_buffer.write(dest_b.wrapping_add(i as isize), MaybeUninit::new(task));
                     }
                 }
 
                 Flavor::Lifo => {
                     for i in 0..batch_size {
-                        // Read the task.
-                        let slot = (*block).slots.get_unchecked(offset + i);
-                        slot.wait_write();
-                        let task = slot.task.get().read();
+                        // // Read the task.
+                        let task = inner.queue.pop_front().expect("task should be in queue");
+                        inner.length -= 1;
 
                         // Write it into the destination queue.
-                        dest_buffer.write(dest_b.wrapping_add((batch_size - 1 - i) as isize), task);
+                        dest_buffer.write(
+                            dest_b.wrapping_add((batch_size - 1 - i) as isize),
+                            MaybeUninit::new(task),
+                        );
                     }
                 }
             }
@@ -1687,20 +1635,20 @@ impl<T> Injector<T> {
                 .back
                 .store(dest_b.wrapping_add(batch_size as isize), Ordering::Release);
 
-            // Destroy the block if we've reached the end, or if another thread wanted to destroy
-            // but couldn't because we were busy reading from the slot.
-            if new_offset == BLOCK_CAP {
-                Block::destroy(block, offset);
-            } else {
-                for i in offset..new_offset {
-                    let slot = (*block).slots.get_unchecked(i);
+            // // Destroy the block if we've reached the end, or if another thread wanted to destroy
+            // // but couldn't because we were busy reading from the slot.
+            // if new_offset == BLOCK_CAP {
+            //     Block::destroy(block, offset);
+            // } else {
+            //     for i in offset..new_offset {
+            //         let slot = (*block).slots.get_unchecked(i);
 
-                    if slot.state.fetch_or(READ, Ordering::AcqRel) & DESTROY != 0 {
-                        Block::destroy(block, offset);
-                        break;
-                    }
-                }
-            }
+            //         if slot.state.fetch_or(READ, Ordering::AcqRel) & DESTROY != 0 {
+            //             Block::destroy(block, offset);
+            //             break;
+            //         }
+            //     }
+            // }
 
             Steal::Success(())
         }
@@ -1726,7 +1674,7 @@ impl<T> Injector<T> {
     /// assert_eq!(q.steal_batch_and_pop(&w), Steal::Success(1));
     /// assert_eq!(w.pop(), Some(2));
     /// ```
-    pub fn steal_batch_and_pop(&self, dest: &Worker<T>) -> Steal<T> {
+    pub fn steal_batch_and_pop(&self, dest: &Worker<T>) -> Steal<Pin<T>> {
         // TODO: we use `MAX_BATCH + 1` as the hard limit for Injecter as the performance is slightly
         // better, but we may change it in the future to be compatible with the same method in Stealer.
         self.steal_batch_with_limit_and_pop(dest, MAX_BATCH + 1)
@@ -1764,70 +1712,20 @@ impl<T> Injector<T> {
     /// assert_eq!(w.pop(), Some(5));
     /// assert_eq!(w.pop(), None);
     /// ```
-    pub fn steal_batch_with_limit_and_pop(&self, dest: &Worker<T>, limit: usize) -> Steal<T> {
+    pub fn steal_batch_with_limit_and_pop(&self, dest: &Worker<T>, limit: usize) -> Steal<Pin<T>> {
         assert!(limit > 0);
-        let mut head;
-        let mut block;
-        let mut offset;
 
-        let backoff = Backoff::new();
-        loop {
-            head = self.head.index.load(Ordering::Acquire);
-            block = self.head.block.load(Ordering::Acquire);
+        let mut inner = match self.inner.try_lock() {
+            Ok(inner) => inner,
+            Err(TryLockError::Poisoned(e)) => panic!("{e}"),
+            Err(TryLockError::WouldBlock) => return Steal::Retry,
+        };
 
-            // Calculate the offset of the index into the block.
-            offset = (head >> SHIFT) % LAP;
-
-            // If we reached the end of the block, wait until the next one is installed.
-            if offset == BLOCK_CAP {
-                backoff.snooze();
-            } else {
-                break;
-            }
+        if inner.length == 0 {
+            return Steal::Empty;
         }
 
-        let mut new_head = head;
-        let advance;
-
-        if new_head & HAS_NEXT == 0 {
-            atomic::fence(Ordering::SeqCst);
-            let tail = self.tail.index.load(Ordering::Relaxed);
-
-            // If the tail equals the head, that means the queue is empty.
-            if head >> SHIFT == tail >> SHIFT {
-                return Steal::Empty;
-            }
-
-            // If head and tail are not in the same block, set `HAS_NEXT` in head.
-            if (head >> SHIFT) / LAP != (tail >> SHIFT) / LAP {
-                new_head |= HAS_NEXT;
-                // We can steal all tasks till the end of the block.
-                advance = (BLOCK_CAP - offset).min(limit);
-            } else {
-                let len = (tail - head) >> SHIFT;
-                // Steal half of the available tasks.
-                advance = ((len + 1) / 2).min(limit);
-            }
-        } else {
-            // We can steal all tasks till the end of the block.
-            advance = (BLOCK_CAP - offset).min(limit);
-        }
-
-        new_head += advance << SHIFT;
-        let new_offset = offset + advance;
-
-        // Try moving the head index forward.
-        if self
-            .head
-            .index
-            .compare_exchange_weak(head, new_head, Ordering::SeqCst, Ordering::Acquire)
-            .is_err()
-        {
-            return Steal::Retry;
-        }
-
-        // Reserve capacity for the stolen batch.
-        let batch_size = new_offset - offset - 1;
+        let batch_size = usize::min((inner.length + 1) / 2, limit) - 1;
         dest.reserve(batch_size);
 
         // Get the destination buffer and back index.
@@ -1835,47 +1733,30 @@ impl<T> Injector<T> {
         let dest_b = dest.inner.back.load(Ordering::Relaxed);
 
         unsafe {
-            // If we've reached the end of the block, move to the next one.
-            if new_offset == BLOCK_CAP {
-                let next = (*block).wait_next();
-                let mut next_index = (new_head & !HAS_NEXT).wrapping_add(1 << SHIFT);
-                if !(*next).next.load(Ordering::Relaxed).is_null() {
-                    next_index |= HAS_NEXT;
-                }
-
-                self.head.block.store(next, Ordering::Release);
-                self.head.index.store(next_index, Ordering::Release);
-            }
-
-            // Read the task.
-            let slot = (*block).slots.get_unchecked(offset);
-            slot.wait_write();
-            let task = slot.task.get().read();
-
+            // Copy values from the injector into the destination queue.
             match dest.flavor {
                 Flavor::Fifo => {
-                    // Copy values from the injector into the destination queue.
                     for i in 0..batch_size {
-                        // Read the task.
-                        let slot = (*block).slots.get_unchecked(offset + i + 1);
-                        slot.wait_write();
-                        let task = slot.task.get().read();
+                        // // Read the task.
+                        let task = inner.queue.pop_front().expect("task should be in queue");
+                        inner.length -= 1;
 
                         // Write it into the destination queue.
-                        dest_buffer.write(dest_b.wrapping_add(i as isize), task);
+                        dest_buffer.write(dest_b.wrapping_add(i as isize), MaybeUninit::new(task));
                     }
                 }
 
                 Flavor::Lifo => {
-                    // Copy values from the injector into the destination queue.
                     for i in 0..batch_size {
-                        // Read the task.
-                        let slot = (*block).slots.get_unchecked(offset + i + 1);
-                        slot.wait_write();
-                        let task = slot.task.get().read();
+                        // // Read the task.
+                        let task = inner.queue.pop_front().expect("task should be in queue");
+                        inner.length -= 1;
 
                         // Write it into the destination queue.
-                        dest_buffer.write(dest_b.wrapping_add((batch_size - 1 - i) as isize), task);
+                        dest_buffer.write(
+                            dest_b.wrapping_add((batch_size - 1 - i) as isize),
+                            MaybeUninit::new(task),
+                        );
                     }
                 }
             }
@@ -1890,22 +1771,24 @@ impl<T> Injector<T> {
                 .back
                 .store(dest_b.wrapping_add(batch_size as isize), Ordering::Release);
 
-            // Destroy the block if we've reached the end, or if another thread wanted to destroy
-            // but couldn't because we were busy reading from the slot.
-            if new_offset == BLOCK_CAP {
-                Block::destroy(block, offset);
-            } else {
-                for i in offset..new_offset {
-                    let slot = (*block).slots.get_unchecked(i);
+            // // Destroy the block if we've reached the end, or if another thread wanted to destroy
+            // // but couldn't because we were busy reading from the slot.
+            // if new_offset == BLOCK_CAP {
+            //     Block::destroy(block, offset);
+            // } else {
+            //     for i in offset..new_offset {
+            //         let slot = (*block).slots.get_unchecked(i);
 
-                    if slot.state.fetch_or(READ, Ordering::AcqRel) & DESTROY != 0 {
-                        Block::destroy(block, offset);
-                        break;
-                    }
-                }
-            }
+            //         if slot.state.fetch_or(READ, Ordering::AcqRel) & DESTROY != 0 {
+            //             Block::destroy(block, offset);
+            //             break;
+            //         }
+            //     }
+            // }
 
-            Steal::Success(task.assume_init())
+            let task = inner.queue.pop_front().expect("task should be in queue");
+            inner.length -= 1;
+            Steal::Success(task)
         }
     }
 
@@ -1923,9 +1806,10 @@ impl<T> Injector<T> {
     /// assert!(!q.is_empty());
     /// ```
     pub fn is_empty(&self) -> bool {
-        let head = self.head.index.load(Ordering::SeqCst);
-        let tail = self.tail.index.load(Ordering::SeqCst);
-        head >> SHIFT == tail >> SHIFT
+        // let head = self.head.index.load(Ordering::SeqCst);
+        // let tail = self.tail.index.load(Ordering::SeqCst);
+        // head >> SHIFT == tail >> SHIFT
+        self.inner.lock().unwrap().length == 0
     }
 
     /// Returns the number of tasks in the queue.
@@ -1944,79 +1828,45 @@ impl<T> Injector<T> {
     /// assert_eq!(q.len(), 2);
     /// ```
     pub fn len(&self) -> usize {
-        loop {
-            // Load the tail index, then load the head index.
-            let mut tail = self.tail.index.load(Ordering::SeqCst);
-            let mut head = self.head.index.load(Ordering::SeqCst);
+        self.inner.lock().unwrap().length
+        // loop {
+        //     // Load the tail index, then load the head index.
+        //     let mut tail = self.tail.index.load(Ordering::SeqCst);
+        //     let mut head = self.head.index.load(Ordering::SeqCst);
 
-            // If the tail index didn't change, we've got consistent indices to work with.
-            if self.tail.index.load(Ordering::SeqCst) == tail {
-                // Erase the lower bits.
-                tail &= !((1 << SHIFT) - 1);
-                head &= !((1 << SHIFT) - 1);
+        //     // If the tail index didn't change, we've got consistent indices to work with.
+        //     if self.tail.index.load(Ordering::SeqCst) == tail {
+        //         // Erase the lower bits.
+        //         tail &= !((1 << SHIFT) - 1);
+        //         head &= !((1 << SHIFT) - 1);
 
-                // Fix up indices if they fall onto block ends.
-                if (tail >> SHIFT) & (LAP - 1) == LAP - 1 {
-                    tail = tail.wrapping_add(1 << SHIFT);
-                }
-                if (head >> SHIFT) & (LAP - 1) == LAP - 1 {
-                    head = head.wrapping_add(1 << SHIFT);
-                }
+        //         // Fix up indices if they fall onto block ends.
+        //         if (tail >> SHIFT) & (LAP - 1) == LAP - 1 {
+        //             tail = tail.wrapping_add(1 << SHIFT);
+        //         }
+        //         if (head >> SHIFT) & (LAP - 1) == LAP - 1 {
+        //             head = head.wrapping_add(1 << SHIFT);
+        //         }
 
-                // Rotate indices so that head falls into the first block.
-                let lap = (head >> SHIFT) / LAP;
-                tail = tail.wrapping_sub((lap * LAP) << SHIFT);
-                head = head.wrapping_sub((lap * LAP) << SHIFT);
+        //         // Rotate indices so that head falls into the first block.
+        //         let lap = (head >> SHIFT) / LAP;
+        //         tail = tail.wrapping_sub((lap * LAP) << SHIFT);
+        //         head = head.wrapping_sub((lap * LAP) << SHIFT);
 
-                // Remove the lower bits.
-                tail >>= SHIFT;
-                head >>= SHIFT;
+        //         // Remove the lower bits.
+        //         tail >>= SHIFT;
+        //         head >>= SHIFT;
 
-                // Return the difference minus the number of blocks between tail and head.
-                return tail - head - tail / LAP;
-            }
-        }
+        //         // Return the difference minus the number of blocks between tail and head.
+        //         return tail - head - tail / LAP;
+        //     }
+        // }
     }
 }
 
-impl<T> Drop for Injector<T> {
-    fn drop(&mut self) {
-        let mut head = *self.head.index.get_mut();
-        let mut tail = *self.tail.index.get_mut();
-        let mut block = *self.head.block.get_mut();
-
-        // Erase the lower bits.
-        head &= !((1 << SHIFT) - 1);
-        tail &= !((1 << SHIFT) - 1);
-
-        unsafe {
-            // Drop all values between `head` and `tail` and deallocate the heap-allocated blocks.
-            while head != tail {
-                let offset = (head >> SHIFT) % LAP;
-
-                if offset < BLOCK_CAP {
-                    // Drop the task in the slot.
-                    let slot = (*block).slots.get_unchecked(offset);
-                    (*slot.task.get()).assume_init_drop();
-                } else {
-                    // Deallocate the block and move to the next one.
-                    let next = *(*block).next.get_mut();
-                    drop(Box::from_raw(block));
-                    block = next;
-                }
-
-                head = head.wrapping_add(1 << SHIFT);
-            }
-
-            // Deallocate the last remaining block.
-            drop(Box::from_raw(block));
-        }
-    }
-}
-
-impl<T> fmt::Debug for Injector<T> {
+impl<K: GetIntrusive<QueueTypes<K, T>> + 'static, T: SharedPointer> fmt::Debug for Injector<K, T> {
     fn fmt(&self, f: &mut fmt::Formatter<'_>) -> fmt::Result {
-        f.pad("Worker { .. }")
+        f.pad("Injector { .. }")
     }
 }
 
